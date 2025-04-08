@@ -54,6 +54,11 @@ th, td {
 tr:hover {
     background-color: #f5f5f5;
 }
+.add-button {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+}
 </style>
 """
 st.markdown(notion_css, unsafe_allow_html=True)
@@ -137,7 +142,7 @@ def add_document(title, notes, tags, files):
     conn.close()
     return document_id
 
-# Parse search query (supports tag:, year:, mime:, AND, OR, -)
+# Parse search query (fixed syntax)
 def parse_search_query(query):
     conditions = []
     params = []
@@ -161,18 +166,25 @@ def parse_search_query(query):
         elif token in ("AND", "OR"):
             conditions.append(token)
         else:
-            conditions.append("title LIKE ? OR notes LIKE ?")
+            conditions.append("(d.title LIKE ? OR d.notes LIKE ?)")
             params.extend([f"%{token}%", f"%{token}%"])
         i += 1
 
-    sql = "SELECT d.document_id, d.title, d.notes, d.created_at, d.archived, group_concat(t.tag) as tags, group_concat(f.filename) as files, group_concat(f.local_path) as local_paths"
-    sql += " FROM Documents d LEFT JOIN Tags t ON d.document_id = t.document_id LEFT JOIN Files f ON d.document_id = f.document_id"
-    sql += " WHERE 1=1"
+    sql = """
+        SELECT d.document_id, d.title, d.notes, d.created_at, d.archived, 
+               group_concat(t.tag) as tags, 
+               group_concat(f.filename) as files, 
+               group_concat(f.local_path) as local_paths
+        FROM Documents d 
+        LEFT JOIN Tags t ON d.document_id = t.document_id 
+        LEFT JOIN Files f ON d.document_id = f.document_id
+        WHERE 1=1
+    """
     if tags:
-        sql += " AND d.document_id IN ( Ascending (SELECT document_id FROM Tags WHERE " + " OR ".join(["tag = ?" for _ in tags]) + ")"
+        sql += " AND d.document_id IN (SELECT document_id FROM Tags WHERE " + " OR ".join(["tag = ?" for _ in tags]) + ")"
         params.extend(tags)
     if years:
-        sql += " AND " + " OR ".join(["strftime('%Y', d.created_at) = ?" for _ in years])
+        sql += " AND (" + " OR ".join(["strftime('%Y', d.created_at) = ?" for _ in years]) + ")"
         params.extend(years)
     if mimes:
         sql += " AND d.document_id IN (SELECT document_id FROM Files WHERE " + " OR ".join(["mimetype LIKE ?" for _ in mimes]) + ")"
@@ -181,12 +193,12 @@ def parse_search_query(query):
         sql += " AND (d.title NOT LIKE ? AND d.notes NOT LIKE ?)"
         params.extend([f"%{ex}%" for ex in excludes] * 2)
     if conditions:
-        sql += " AND (" + " ".join(conditions) + ")"
-    sql += " GROUP BY d.document_id"
+        sql += " AND " + " ".join(conditions)
+    sql += " GROUP BY d.document_id ORDER BY d.created_at DESC"
     return sql, params
 
 # Search documents
-def search_documents(query):
+def search_documents(query=""):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
@@ -207,15 +219,25 @@ def toggle_archive(document_id, archive=True):
 # Streamlit app
 st.title("DocStore")
 
+# Add button in top-right corner
+st.markdown('<div class="add-button">', unsafe_allow_html=True)
+if st.button("Add Document"):
+    st.session_state["page"] = "Add Document"
+st.markdown('</div>', unsafe_allow_html=True)
+
 # Sidebar
 with st.sidebar:
     st.header("Workspace")
-    page = st.selectbox("Navigate", ["Add Document", "Search Documents", "Tags"], format_func=lambda x: f"📋 {x}")
+    page = st.selectbox("Navigate", ["Documents", "Tags"], format_func=lambda x: f"📋 {x}")
     st.markdown("---")
     st.write("Built with ❤️ by xAI")
 
+# Default to Documents page if not set
+if "page" not in st.session_state:
+    st.session_state["page"] = "Documents"
+
 # Add Document Page
-if page == "Add Document":
+if st.session_state.get("page") == "Add Document":
     st.header("New Document")
     with st.form("add_form"):
         title = st.text_input("Title", placeholder="Enter document title")
@@ -226,36 +248,36 @@ if page == "Add Document":
         if submit and title and files:
             document_id = add_document(title, notes, tags, files)
             st.success(f"Document saved! ID: {document_id}")
+            st.session_state["page"] = "Documents"  # Return to main page
 
-# Search Documents Page
-elif page == "Search Documents":
+# Documents Page (main page)
+elif page == "Documents":
     st.header("Documents")
     query = st.text_input("Search", placeholder="e.g., tag:work year:2023 -draft")
     show_archived = st.checkbox("Show archived documents")
-    if query or show_archived:
-        results = search_documents(query)
-        if not show_archived:
-            results = [r for r in results if not r["archived"]]
-        if results:
-            for result in results:
-                with st.expander(f"{result['title']} ({result['created_at'].strftime('%Y-%m-%d')})"):
-                    st.write(f"**Notes**: {result['notes'] or 'None'}")
-                    st.write(f"**Tags**: {result['tags'] or 'None'}")
-                    files = result["files"].split(",") if result["files"] else []
-                    local_paths = result["local_paths"].split(",") if result["local_paths"] else []
-                    for file, path in zip(files, local_paths):
-                        with open(path, "rb") as f:
-                            st.download_button(f"Download {file}", f, file_name=file)
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        if st.button("Archive" if not result["archived"] else "Unarchive", key=f"toggle_{result['document_id']}"):
-                            toggle_archive(result['document_id'], not result["archived"])
-                            st.experimental_rerun()
-                    with col2:
-                        if st.button("Open Files", key=f"open_{result['document_id']}"):
-                            st.write("Opening files locally not supported in browser; download instead.")
-        else:
-            st.write("No results found.")
+    results = search_documents(query)
+    if not show_archived:
+        results = [r for r in results if not r["archived"]]
+    if results:
+        for result in results:
+            with st.expander(f"{result['title']} ({result['created_at'].strftime('%Y-%m-%d')})"):
+                st.write(f"**Notes**: {result['notes'] or 'None'}")
+                st.write(f"**Tags**: {result['tags'] or 'None'}")
+                files = result["files"].split(",") if result["files"] else []
+                local_paths = result["local_paths"].split(",") if result["local_paths"] else []
+                for file, path in zip(files, local_paths):
+                    with open(path, "rb") as f:
+                        st.download_button(f"Download {file}", f, file_name=file)
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("Archive" if not result["archived"] else "Unarchive", key=f"toggle_{result['document_id']}"):
+                        toggle_archive(result['document_id'], not result["archived"])
+                        st.experimental_rerun()
+                with col2:
+                    if st.button("Open Files", key=f"open_{result['document_id']}"):
+                        st.write("Opening files locally not supported in browser; download instead.")
+    else:
+        st.write("No documents uploaded yet.")
 
 # Tags Page
 elif page == "Tags":
